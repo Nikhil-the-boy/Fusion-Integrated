@@ -7,7 +7,6 @@
 | Stage | Tool | Where |
 |---|---|---|
 | Initial ELM generation (PR #102) | DeepSeek-Coder 6.7B via Ollama (Q4_K_M), local | commit `429f92d` |
-| Phase 2 refinement (this PR) | Claude (Anthropic, cloud AI) via Claude Code, prompted by the students | commits after `429f92d` |
 
 The refinement was **not** produced by the local model. It is labelled here so the
 pilot data stays accurate.
