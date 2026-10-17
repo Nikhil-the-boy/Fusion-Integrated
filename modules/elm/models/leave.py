@@ -1,71 +1,88 @@
+"""ELM tables.
+
+People are referenced by IAM user id, never by ForeignKey: there is no user
+table in this database (ADR-0013). Category and status are plain choices
+instead of lookup tables, so the domain enums are the single source of truth.
+"""
 from django.db import models
-from django.contrib.auth import get_user_model
+from django.db.models import F, Q
 
-User = get_user_model()
+from core.db.mixins import TimeStampedModel
+from modules.elm.domain.entities import HalfDay, LeaveCategory, LeaveStatus
 
-
-class LeaveTypeMaster(models.Model):
-    TYPE_CHOICES = (
-        ('CL', 'Casual Leave'),
-        ('RH', 'Restricted Holiday'),
-        ('SCL', 'Special Casual Leave'),
-        ('EL', 'Earned Leave'),
-        ('VL', 'Vacation Leave'),
-        ('COL', 'Commuted Leave'),
-    )
-    code = models.CharField(max_length=5, choices=TYPE_CHOICES, unique=True)
-    description = models.CharField(max_length=100, blank=True)
-
-    def __str__(self):
-        return f"{self.code} - {self.get_code_display()}"
+CATEGORY_CHOICES = [(c.value, c.name) for c in LeaveCategory]
+STATUS_CHOICES = [(s.value, s.value.replace("_", " ").title()) for s in LeaveStatus]
+HALF_CHOICES = [(h.value, h.name.title()) for h in HalfDay]
 
 
-class LeaveStatusMaster(models.Model):
-    STATUS_CHOICES = (
-        ('DRAFT', 'Draft'),
-        ('PENDING', 'Pending Recommendation'),
-        ('RECOMMENDED', 'Recommended'),
-        ('APPROVED', 'Approved'),
-        ('REJECTED', 'Rejected'),
-        ('CANCELLED', 'Cancelled'),
-    )
-    status_code = models.CharField(max_length=15, choices=STATUS_CHOICES, unique=True)
+class LeaveBalance(TimeStampedModel):
+    """One row per employee, year and category, created on first use from the
+    annual entitlement."""
 
-    def __str__(self):
-        return self.status_code
-
-
-class UserLeaveQuota(models.Model):
-    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='elm_quotas')
-    academic_session = models.CharField(max_length=15, default='2025-2026')
-    leave_type = models.ForeignKey(LeaveTypeMaster, on_delete=models.CASCADE)
-    total_credited = models.DecimalField(max_digits=5, decimal_places=1, default=0.0)
-    total_availed = models.DecimalField(max_digits=5, decimal_places=1, default=0.0)
-    current_balance = models.DecimalField(max_digits=5, decimal_places=1, default=0.0)
+    user_id = models.IntegerField()
+    year = models.PositiveSmallIntegerField()
+    category = models.CharField(max_length=3, choices=CATEGORY_CHOICES)
+    credited = models.DecimalField(max_digits=5, decimal_places=1)
+    availed = models.DecimalField(max_digits=5, decimal_places=1, default=0)
 
     class Meta:
-        unique_together = ('user', 'academic_session', 'leave_type')
+        constraints = [
+            models.UniqueConstraint(fields=["user_id", "year", "category"],
+                                    name="elm_balance_one_per_category"),
+            models.CheckConstraint(condition=Q(availed__gte=0) & Q(availed__lte=F("credited")),
+                                   name="elm_balance_availed_within_credit"),
+        ]
 
 
-class LeaveApplication(models.Model):
-    applicant = models.ForeignKey(User, on_delete=models.CASCADE, related_name='elm_requests')
-    leave_type = models.ForeignKey(LeaveTypeMaster, on_delete=models.CASCADE)
+class LeaveRequest(TimeStampedModel):
+    applicant_user_id = models.IntegerField()
+    category = models.CharField(max_length=3, choices=CATEGORY_CHOICES)
     start_date = models.DateField()
     end_date = models.DateField()
-    number_of_days = models.DecimalField(max_digits=4, decimal_places=1, default=1.0)
-    reason = models.TextField()
-    status = models.ForeignKey(LeaveStatusMaster, on_delete=models.CASCADE)
-    approving_authority = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='elm_supervised_requests')
-    reviewer_comments = models.TextField(blank=True, null=True)
-    created_at = models.DateTimeField(auto_now_add=True)
+    half = models.CharField(max_length=6, choices=HALF_CHOICES, blank=True, default="")
+    days = models.DecimalField(max_digits=5, decimal_places=1)
+    reason = models.TextField(max_length=2000)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES,
+                              default=LeaveStatus.PENDING)
+
+    # BR-EL-013: Station Leave is part of the same application.
+    is_station_leave = models.BooleanField(default=False)
+    station_address = models.CharField(max_length=300, blank=True)
+    station_contact = models.CharField(max_length=30, blank=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(condition=Q(end_date__gte=F("start_date")),
+                                   name="elm_request_end_after_start"),
+            models.CheckConstraint(condition=Q(days__gt=0), name="elm_request_days_positive"),
+            models.CheckConstraint(condition=Q(status__in=[s.value for s in LeaveStatus]),
+                                   name="elm_request_status_valid"),
+        ]
+        indexes = [
+            # "My leave" and the overlap check both filter on the applicant.
+            models.Index(fields=["applicant_user_id", "-start_date"],
+                         name="elm_request_applicant_idx"),
+            # The approvals queue.
+            models.Index(fields=["status", "-created_at"], name="elm_request_status_idx"),
+        ]
 
     def __str__(self):
-        return f"{self.applicant.username} - {self.leave_type.code} ({self.start_date} to {self.end_date})"
+        return f"{self.category} {self.start_date}..{self.end_date} ({self.status})"
 
 
-class StationOutstationInfo(models.Model):
-    application = models.OneToOneField(LeaveApplication, on_delete=models.CASCADE, related_name='outstation_detail')
-    source_city = models.CharField(max_length=100, default='Jabalpur')
-    target_destination = models.CharField(max_length=200)
-    contact_number = models.CharField(max_length=25)
-    residential_address = models.TextField()
+class LeaveRequestTransition(models.Model):
+    """Append-only history: who moved a request, from where to where, and why."""
+
+    request = models.ForeignKey(LeaveRequest, on_delete=models.CASCADE,
+                                related_name="transitions")
+    from_status = models.CharField(max_length=16)
+    to_status = models.CharField(max_length=16)
+    actor_user_id = models.IntegerField()
+    remarks = models.CharField(max_length=500, blank=True)
+    at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["at", "id"]
+
+    def __str__(self):
+        return f"{self.from_status} -> {self.to_status}"

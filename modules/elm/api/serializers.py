@@ -1,43 +1,59 @@
 from rest_framework import serializers
-from ..models.leave import LeaveTypeMaster, LeaveStatusMaster, UserLeaveQuota, LeaveApplication, StationOutstationInfo
 
-class LeaveTypeMasterSerializer(serializers.ModelSerializer):
+from modules.elm.domain.entities import HalfDay, LeaveCategory, LeaveStatus
+from modules.elm.models import LeaveRequest, LeaveRequestTransition
+from modules.elm.services import leaves as service
+
+
+class LeaveHistorySerializer(serializers.ModelSerializer):
     class Meta:
-        model = LeaveTypeMaster
-        fields = ['id', 'code', 'description']
+        model = LeaveRequestTransition
+        fields = ["from_status", "to_status", "actor_user_id", "remarks", "at"]
 
-class StationOutstationInfoSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = StationOutstationInfo
-        fields = ['id', 'source_city', 'target_destination', 'contact_number', 'residential_address']
 
-class UserLeaveQuotaSerializer(serializers.ModelSerializer):
-    leave_type_code = serializers.CharField(source='leave_type.code', read_only=True)
+class LeaveRequestSerializer(serializers.ModelSerializer):
+    """Read shape. `allowed_transitions` is computed for the caller, so the UI
+    shows only the buttons that would succeed."""
 
-    class Meta:
-        model = UserLeaveQuota
-        fields = ['id', 'academic_session', 'leave_type', 'leave_type_code', 'total_credited', 'total_availed', 'current_balance']
-
-class LeaveApplicationSerializer(serializers.ModelSerializer):
-    outstation_detail = StationOutstationInfoSerializer(required=False)
-    applicant_name = serializers.CharField(source='applicant.username', read_only=True)
-    status_label = serializers.CharField(source='status.status_code', read_only=True)
+    allowed_transitions = serializers.SerializerMethodField()
+    history = LeaveHistorySerializer(source="transitions", many=True, read_only=True)
 
     class Meta:
-        model = LeaveApplication
-        fields = [
-            'id', 'applicant', 'applicant_name', 'leave_type', 'start_date', 'end_date',
-            'number_of_days', 'reason', 'status', 'status_label', 'approving_authority',
-            'reviewer_comments', 'created_at', 'outstation_detail'
-        ]
-        read_only_fields = ['applicant', 'created_at']
+        model = LeaveRequest
+        fields = ["id", "applicant_user_id", "category", "start_date", "end_date", "half",
+                  "days", "reason", "status", "is_station_leave", "station_address",
+                  "station_contact", "created_at", "allowed_transitions", "history"]
+        read_only_fields = fields
 
-    def create(self, validated_data):
-        outstation_data = validated_data.pop('outstation_detail', None)
-        request = self.context.get('request')
-        user = request.user if request else validated_data.get('applicant')
-        validated_data['applicant'] = user
-        application = LeaveApplication.objects.create(**validated_data)
-        if outstation_data:
-            StationOutstationInfo.objects.create(application=application, **outstation_data)
-        return application
+    def get_allowed_transitions(self, obj) -> list[str]:
+        principal = self.context.get("principal")
+        return service.allowed_targets(obj, principal) if principal else []
+
+
+class LeaveApplySerializer(serializers.Serializer):
+    category = serializers.ChoiceField(choices=[c.value for c in LeaveCategory])
+    start_date = serializers.DateField()
+    end_date = serializers.DateField()
+    half = serializers.ChoiceField(choices=[h.value for h in HalfDay], required=False,
+                                   allow_blank=True, default="")
+    reason = serializers.CharField(max_length=2000)
+    is_station_leave = serializers.BooleanField(required=False, default=False)
+    station_address = serializers.CharField(max_length=300, required=False,
+                                            allow_blank=True, default="")
+    station_contact = serializers.CharField(max_length=30, required=False,
+                                            allow_blank=True, default="")
+
+
+class LeaveTransitionSerializer(serializers.Serializer):
+    to_status = serializers.ChoiceField(
+        choices=[s.value for s in LeaveStatus if s != LeaveStatus.PENDING])
+    remarks = serializers.CharField(max_length=500, required=False, allow_blank=True,
+                                    default="")
+
+
+class LeaveBalanceSerializer(serializers.Serializer):
+    category = serializers.CharField()
+    credited = serializers.DecimalField(max_digits=5, decimal_places=1)
+    availed = serializers.DecimalField(max_digits=5, decimal_places=1)
+    reserved = serializers.DecimalField(max_digits=5, decimal_places=1)
+    available = serializers.DecimalField(max_digits=5, decimal_places=1)

@@ -1,85 +1,112 @@
-import React, { useState } from 'react';
-import axios from 'axios';
+import { useState } from "react";
+import {
+  Alert, Button, Checkbox, Group, SegmentedControl, Select, SimpleGrid, Stack,
+  Textarea, TextInput,
+} from "@mantine/core";
 
-const LeaveApplicationForm: React.FC = () => {
-  const [leaveType, setLeaveType] = useState('');
-  const [startDate, setStartDate] = useState('');
-  const [endDate, setEndDate] = useState('');
-  const [purpose, setPurpose] = useState('');
-  const [isStationLeave, setIsStationLeave] = useState(false);
-  const [destination, setDestination] = useState('');
-  const [emergencyContact, setEmergencyContact] = useState('');
+import { errorMessage } from "../../lib/http";
+import type { HalfDay, LeaveApplication, LeaveCategory } from "./api/types";
+import { CATEGORY_LABELS } from "./api/types";
 
-  const handleSubmit = async (event: React.FormEvent) => {
-    event.preventDefault();
-
-    const data = {
-      leaveType,
-      startDate,
-      endDate,
-      purpose,
-      stationLeave: isStationLeave,
-      destination: isStationLeave ? destination : '',
-      emergencyContact: isStationLeave ? emergencyContact : '',
-    };
-
-    try {
-      await axios.post('/api/elm/leaves/', data);
-      alert('Leave application submitted successfully');
-    } catch (error) {
-      alert('Failed to submit leave application');
-    }
-  };
-
-  return (
-    <form onSubmit={handleSubmit}>
-      <label>
-        Leave Type:
-        <select value={leaveType} onChange={e => setLeaveType(e.target.value)}>
-          <option value="">Select...</option>
-          <option value="annual">Annual</option>
-          <option value="sick">Sick</option>
-          <option value="vacation">Vacation</option>
-        </select>
-      </label>
-
-      <label>
-        Start Date:
-        <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} required />
-      </label>
-
-      <label>
-        End Date:
-        <input type="date" value={endDate} onChanget={e => setEndDate(e.target.value)} required />
-      </label>
-
-      <label>
-        Purpose:
-        <textarea value={purpose} onChange={e => setPurpose(e.target.value)} required />
-      </label>
-
-      <label>
-        <input type="checkbox" checked={isStationLeave} onChange={e => setIsStationLeave(e.target.checked)} />
-        Station Leave
-      </label>
-
-      {isStationLeave && (
-        <>
-          <label>
-            Destination:
-            <input type="text" value={destination} onChange={e => setDestination(e.target.value)} required />
-          </label>
-
-          <label>
-            Emergency Contact:
-            <input type="text" value={emergencyContact} onChange={e => setEmergencyContact(e.target.value)} required />
-          </label>
-        </>
-      )}
-
-      <button type="submit">Submit</button>
-    </form>
-  );
+const EMPTY: LeaveApplication = {
+  category: "CL", start_date: "", end_date: "", half: "", reason: "",
+  is_station_leave: false, station_address: "", station_contact: "",
 };
 
-export default LeaveApplicationForm;
+/** The one leave form. Station Leave is a section of it, not a separate
+ *  request (BR-EL-013). The server re-checks every rule; the client only
+ *  stops obviously incomplete submissions. */
+export function LeaveApplicationForm({ onSubmit, submitting, error }: {
+  onSubmit: (body: LeaveApplication, reset: () => void) => void;
+  submitting?: boolean;
+  error?: unknown;
+}) {
+  const [form, setForm] = useState<LeaveApplication>(EMPTY);
+  const set = <K extends keyof LeaveApplication>(k: K, v: LeaveApplication[K]) =>
+    setForm((f) => ({ ...f, [k]: v }));
+
+  const halfDay = form.category === "CL" && form.half !== "";
+  const incomplete = !form.start_date || !(halfDay || form.end_date) ||
+    !form.reason.trim() ||
+    (form.is_station_leave &&
+      !(form.station_address.trim() && form.station_contact.trim()));
+
+  function submit(e: React.FormEvent) {
+    e.preventDefault();
+    const body = halfDay ? { ...form, end_date: form.start_date } : form;
+    onSubmit(body, () => setForm(EMPTY));
+  }
+
+  return (
+    <form onSubmit={submit}>
+      <Stack>
+        {error ? <Alert color="red">{errorMessage(error)}</Alert> : null}
+        <Select
+          label="Leave category" required allowDeselect={false}
+          data={Object.entries(CATEGORY_LABELS).map(([value, label]) => ({
+            value, label: `${label} (${value})`,
+          }))}
+          value={form.category}
+          onChange={(v) => setForm((f) => ({
+            ...f, category: (v ?? "CL") as LeaveCategory,
+            half: v === "CL" ? f.half : "",
+          }))}
+        />
+        {form.category === "CL" && (
+          <SegmentedControl
+            value={form.half}
+            onChange={(v) => set("half", v as HalfDay)}
+            data={[
+              { value: "", label: "Full day(s)" },
+              { value: "first", label: "First half" },
+              { value: "second", label: "Second half" },
+            ]}
+          />
+        )}
+        <SimpleGrid cols={{ base: 1, sm: 2 }}>
+          <TextInput
+            type="date" label={halfDay ? "Date" : "From"} required
+            value={form.start_date}
+            onChange={(e) => set("start_date", e.currentTarget.value)}
+          />
+          {!halfDay && (
+            <TextInput
+              type="date" label="To" required min={form.start_date || undefined}
+              value={form.end_date}
+              onChange={(e) => set("end_date", e.currentTarget.value)}
+            />
+          )}
+        </SimpleGrid>
+        <Textarea
+          label="Reason" required autosize minRows={2} maxLength={2000}
+          value={form.reason}
+          onChange={(e) => set("reason", e.currentTarget.value)}
+        />
+        <Checkbox
+          label="I will be away from the station (Station Leave)"
+          checked={form.is_station_leave}
+          onChange={(e) => set("is_station_leave", e.currentTarget.checked)}
+        />
+        {form.is_station_leave && (
+          <SimpleGrid cols={{ base: 1, sm: 2 }}>
+            <TextInput
+              label="Address while away" required maxLength={300}
+              value={form.station_address}
+              onChange={(e) => set("station_address", e.currentTarget.value)}
+            />
+            <TextInput
+              label="Contact number while away" required maxLength={30}
+              value={form.station_contact}
+              onChange={(e) => set("station_contact", e.currentTarget.value)}
+            />
+          </SimpleGrid>
+        )}
+        <Group justify="flex-end">
+          <Button type="submit" loading={submitting} disabled={incomplete}>
+            Submit application
+          </Button>
+        </Group>
+      </Stack>
+    </form>
+  );
+}
